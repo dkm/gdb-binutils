@@ -57,6 +57,7 @@
 #include "demanguse.h"
 #include "dwarf.h"
 #include "ctf-api.h"
+#include "btf.h"
 #include "sframe-api.h"
 #include "getopt.h"
 #include "safe-ctype.h"
@@ -108,6 +109,8 @@ static int dump_stab_section_info;	/* --stabs */
 static int dump_ctf_section_info;       /* --ctf */
 static char *dump_ctf_section_name;
 static char *dump_ctf_parent_name;	/* --ctf-parent */
+static int dump_btf_section_info;       /* --btf */
+static char *dump_btf_section_name;
 static int dump_sframe_section_info;	/* --sframe */
 static char *dump_sframe_section_name;
 static int do_demangle;			/* -C, --demangle */
@@ -320,6 +323,8 @@ usage (FILE *stream, int status)
   fprintf (stream, _("\
   -L, --process-links      Display the contents of non-debug sections in\n\
                             separate debuginfo files.  (Implies -WK)\n"));
+  fprintf (stream, _("\
+      --btf[=SECTION]      Display BTF info from SECTION, (default `.btf')\n"));
 #ifdef ENABLE_LIBCTF
   fprintf (stream, _("\
       --ctf[=SECTION]      Display CTF info from SECTION, (default `.ctf')\n"));
@@ -479,6 +484,7 @@ enum option_values
     OPTION_NO_RECURSE_LIMIT,
     OPTION_INLINES,
     OPTION_SOURCE_COMMENT,
+    OPTION_BTF,
 #ifdef ENABLE_LIBCTF
     OPTION_CTF,
     OPTION_CTF_PARENT,
@@ -494,6 +500,7 @@ static struct option long_options[]=
   {"all-headers", no_argument, NULL, 'x'},
   {"architecture", required_argument, NULL, 'm'},
   {"archive-headers", no_argument, NULL, 'a'},
+  {"btf", optional_argument, NULL, OPTION_BTF},
 #ifdef ENABLE_LIBCTF
   {"ctf", optional_argument, NULL, OPTION_CTF},
   {"ctf-parent", required_argument, NULL, OPTION_CTF_PARENT},
@@ -3957,7 +3964,7 @@ disassemble_section (bfd *abfd, asection *section, void *inf)
 	      for (++place; place < sorted_symcount; place++)
 		{
 		  sym = sorted_syms[place];
-		  
+
 		  if (bfd_asymbol_value (sym) != addr)
 		    break;
 		  if (! pinfo->symbol_is_valid (sym, pinfo))
@@ -3968,7 +3975,7 @@ disassemble_section (bfd *abfd, asection *section, void *inf)
 		  objdump_print_addr_with_sym (abfd, section, sym, addr, pinfo, false);
 		  pinfo->fprintf_func (pinfo->stream, ":\n");
 		}
-	    }	   
+	    }
 	}
 
       if (sym != NULL && bfd_asymbol_value (sym) > addr)
@@ -4691,6 +4698,293 @@ dump_bfd_header (bfd *abfd)
   printf ("\n");
 }
 
+
+/* Dump information for a single BTF entry.  */
+
+static void
+dump_btf_entry (bfd *abfd ATTRIBUTE_UNUSED, bfd_byte *buf ATTRIBUTE_UNUSED,
+                bfd_vma strtab_offset, bfd_vma entry_offset,
+                btf_entry_id entry_id,
+                struct btf_entry *entry ATTRIBUTE_UNUSED)
+{
+  uint32_t vlen = BTF_ENTRY_INFO_VLEN (entry->info);
+  uint32_t kind = BTF_ENTRY_INFO_KIND (entry->info);
+  uint32_t kind_flag = BTF_ENTRY_INFO_KIND_FLAG (entry->info);
+  const char *entry_name
+    = entry->name == 0 ? "(anon)" : (char *) buf + strtab_offset + entry->name;
+  bfd_byte *payload = buf + entry_offset + sizeof (struct btf_entry);
+
+  printf ("[%u] ", entry_id);
+  switch (kind)
+    {
+    case BTF_KIND_INT:
+      {
+        uint8_t encoding;
+        struct btf_integral *integral = btf_read_integral (abfd, payload);
+
+        printf ("INT '%s' size=%d bits_offset=%d nr_bits=%d",
+                entry_name,
+                BTF_INT_BITS (integral->info) / 8,
+                BTF_INT_OFFSET (integral->info),
+                BTF_INT_BITS (integral->info));
+
+        encoding = BTF_INT_ENCODING (integral->info);
+        if (encoding != 0)
+          {
+            char *sep = "";
+
+            printf (" encoding=");
+            if (BTF_INT_ENCODING_SIGNED_P (encoding))
+              {
+                printf ("%sSIGNED", sep);
+                sep = ",";
+              }
+            if (BTF_INT_ENCODING_CHAR_P (encoding))
+              {
+                printf ("%sCHAR", sep);
+                sep = ",";
+              }
+            if (BTF_INT_ENCODING_BOOL_P (encoding))
+              {
+                printf ("%sBOOL", sep);
+                sep = ",";
+              }
+          }
+
+        free (integral);
+        break;
+      }
+    case BTF_KIND_ARRAY:
+      {
+        struct btf_array *array = btf_read_array (abfd, payload);
+
+        printf ("ARRAY '%s' type_id=%u index_type_id=%u nr_elems=%u",
+                entry_name, array->elem_type, array->index_type, array->nelems);
+        break;
+      }
+    case BTF_KIND_PTR:
+      /* Fallthrough.  */
+    case BTF_KIND_TYPEDEF:
+      /* Fallthrough.  */
+    case BTF_KIND_CONST:
+      /* Fallthrough.  */
+    case BTF_KIND_VOLATILE:
+      /* Fallthrough.  */
+    case BTF_KIND_RESTRICT:
+      /* Fallthrough.  */
+    case BTF_KIND_TYPE_TAG:
+      printf ("%s '%s' type_id=%u",
+              (kind == BTF_KIND_PTR ? "PTR"
+               : kind == BTF_KIND_TYPEDEF ? "TYPEDEF"
+               : kind == BTF_KIND_CONST ? "CONST"
+               : kind == BTF_KIND_VOLATILE ? "VOLATILE"
+               : kind == BTF_KIND_RESTRICT ? "RESTRICT"
+               : "TYPE_TAG"),
+              entry_name, entry->size_or_entry_id);
+      break;
+    case BTF_KIND_FLOAT:
+      printf ("FLOAT '%s' size=%u",
+              entry_name, entry->size_or_entry_id);
+      break;
+    case BTF_KIND_FWD:
+      /* Whether the forward reference is for an union or a struct is
+         determined by the entry's kind flag.  */
+      printf ("FWD '%s' fwd_kind=%s",
+              entry_name, kind_flag ? "union" : "struct");
+      break;
+    case BTF_KIND_DECL_TAG:
+      {
+        struct btf_decl_tag *decl_tag = btf_read_decl_tag (abfd, payload);
+
+        printf ("DECL_TAG '%s' type_id=%u component_idx=%u",
+                entry_name, entry->size_or_entry_id, decl_tag->component_idx);
+        free (decl_tag);
+        break;
+      }
+    case BTF_KIND_FUNC:
+      /* Note how the linkage of FUNC entries is encoded in the vlen
+         field of `entry' and not in a field in a payload like in
+         variables.  */
+      printf ("FUNC '%s' type_id=%u linkage=%s",
+              entry_name, entry->size_or_entry_id,
+              vlen == BTF_FUNC_STATIC ? "static"
+              : vlen == BTF_FUNC_GLOBAL ? "global"
+              : vlen == BTF_FUNC_EXTERN ? "extern"
+              : "unknown");
+      break;
+    case BTF_KIND_VAR:
+      {
+        struct btf_var *var = btf_read_var (abfd, payload);
+
+        printf ("VAR '%s' type_id=%u linkage=%s",
+                entry_name, entry->size_or_entry_id,
+                var->linkage == BTF_VAR_STATIC ? "static"
+                : var->linkage == BTF_VAR_GLOBAL_ALLOCATED ? "global-alloc"
+                : var->linkage == BTF_VAR_GLOBAL_EXTERN ? "global-extern"
+                : "unknown");
+        free (var);
+        break;
+      }
+    case BTF_KIND_STRUCT:
+      /* Fallthrough.  */
+    case BTF_KIND_UNION:
+      {
+        uint32_t i;
+
+        printf ("%s '%s' size=%u vlen=%u",
+                kind ? "STRUCT" : "UNION",
+                entry_name, entry->size_or_entry_id, vlen);
+        for (i = 0; i < vlen; ++i)
+          {
+            struct btf_member *member = btf_read_member (abfd, payload);
+
+            printf ("\n        '%s' type_id=%u ",
+                    member->name == 0 ? "(anon)" : (char *) buf + strtab_offset + member->name,
+                    member->entry_id);
+            if (kind_flag)
+              {
+                uint32_t bitfield_offset = BTF_MEMBER_BITFIELD_OFFSET (member->offset);
+                uint32_t bitfield_size = BTF_MEMBER_BITFIELD_SIZE (member->offset);
+
+                /* This member may be a bitfield if bits_offset > 0.  */
+                printf ("bits_offset=%u", bitfield_offset);
+                if (bitfield_size > 0)
+                  printf (" bitfield_size=%u", bitfield_size);
+              }
+            else
+              {
+                /* This member is a regular field.  */
+                printf ("bits_offset=%u", member->offset);
+              }
+
+            payload += sizeof (struct btf_member);
+            free (member);
+          }
+        break;
+      }
+    case BTF_KIND_DATASEC:
+      {
+        uint32_t i;
+
+        printf ("DATASEC '%s' size=%u vlen=%u",
+                entry_name, entry->size_or_entry_id, vlen);
+        for (i = 0; i < vlen; ++i)
+          {
+            struct btf_var_secinfo *var_secinfo
+              = btf_read_var_secinfo (abfd, payload);
+
+            printf ("\n        type_id=%u offset=%u size=%u",
+                    var_secinfo->var_type,
+                    var_secinfo->offset,
+                    var_secinfo->size);
+            payload += sizeof (struct btf_var_secinfo);
+            free (var_secinfo);
+          }
+        break;
+      }
+    case BTF_KIND_FUNC_PROTO:
+      {
+        uint32_t i;
+
+        printf ("FUNC_PROTO '%s' ret_type_id=%u vlen=%u",
+                entry_name, entry->size_or_entry_id, vlen);
+        for (i = 0; i < vlen; ++i)
+          {
+            struct btf_param *param = btf_read_param (abfd, payload);
+
+            printf ("\n        '%s' type_id=%u",
+                    (char *) buf + strtab_offset + param->name,
+                    param->param_type);
+            payload += sizeof (struct btf_param);
+            free (param);
+          }
+        break;
+      }
+    case BTF_KIND_ENUM:
+      /* Fallthrough.  */
+    case BTF_KIND_ENUM64:
+      {
+        uint32_t i;
+
+        /* Note how the signedness of the enumerated values is encoded
+           in kind_flag.  */
+        printf ("%s '%s' encoding=%s size=%u vlen=%u",
+                kind == BTF_KIND_ENUM ? "ENUM" : "ENUM64",
+                entry_name,
+                kind_flag ? "SIGNED" : "UNSIGNED",
+                entry->size_or_entry_id,
+                vlen);
+
+        for (i = 0; i < vlen; ++i)
+          {
+            if (kind == BTF_KIND_ENUM)
+              {
+                struct btf_enum *anenum = btf_read_enum (abfd, payload);
+                char *name = (char *) buf + strtab_offset + anenum->name;
+
+                if (kind_flag)
+                  printf ("\n        '%s' val=%d", name, anenum->val);
+                else
+                  printf ("\n        '%s' val=%u", name, (uint32_t) anenum->val);
+                payload += sizeof (struct btf_enum);
+                free (anenum);
+              }
+            else
+              {
+                struct btf_enum64 *anenum = btf_read_enum64 (abfd, payload);
+                char *name = (char *) buf + strtab_offset + anenum->name;
+
+                if (kind_flag)
+                  printf ("        '%s' val=%" PRIi64,
+                          name, BTF_ENUM64_VALUE (anenum));
+                else
+                  printf ("        '%s' val=%" PRIu64,
+                          name, (uint64_t) BTF_ENUM64_VALUE (anenum));
+                payload += sizeof (struct btf_enum64);
+                free (anenum);
+              }
+          }
+
+        break;
+      } 
+    default:
+      printf ("UNKNOWN entry kind %u", BTF_ENTRY_INFO_KIND (entry->info));
+      break;
+    }
+
+  printf ("\n");
+}
+
+/* Dump the BTF debugging information.  */
+
+static void
+dump_btf (bfd *abfd, const char *sect_name)
+{
+  asection *sec;
+
+  if (sect_name == NULL)
+    sect_name = ".BTF";
+
+  sec = bfd_get_section_by_name (abfd, sect_name);
+  if (sec == NULL)
+    {
+      printf (_("No %s section present\n\n"), sanitize_string (sect_name));
+      my_bfd_nonfatal (bfd_get_filename (abfd));
+      return;
+    }
+  if ((bfd_section_flags (sec) & SEC_HAS_CONTENTS) == 0)
+    {
+      bfd_set_error (bfd_error_no_contents);
+      return;
+    }
+
+  if (!btf_map (abfd, sec, dump_btf_entry))
+    {
+      printf (_("Invalid BTF data in section %s\n"),
+              sanitize_string (sect_name));
+      my_bfd_nonfatal (bfd_get_filename (abfd));
+    }
+}
 
 #ifdef ENABLE_LIBCTF
 /* Formatting callback function passed to ctf_dump.  Returns either the pointer
@@ -5529,12 +5823,12 @@ might_need_separate_debug_info (bool is_mainfile)
      deliberate user action.  */
   if (DEFAULT_FOR_FOLLOW_LINKS == 0 && do_follow_links)
     return true;
-  
+
   if (process_links || dump_symtab || dump_debugging
       || dump_dwarf_section_info || with_source_code)
     return true;
 
-  return false;  
+  return false;
 }
 
 /* Dump selected contents of ABFD.  */
@@ -5673,6 +5967,8 @@ dump_bfd (bfd *abfd, bool is_mainfile)
     dump_dwarf (abfd, is_mainfile);
   if (is_mainfile || process_links)
     {
+      if (dump_btf_section_info)
+        dump_btf (abfd, dump_btf_section_name);
       if (dump_ctf_section_info)
 	dump_ctf (abfd, dump_ctf_section_name, dump_ctf_parent_name);
       if (dump_sframe_section_info)
@@ -6017,7 +6313,7 @@ main (int argc, char **argv)
 	    disassembler_color = on_if_terminal_output;
 	  else if (streq (optarg, "color")
 		   || streq (optarg, "colour")
-		   || streq (optarg, "on")) 
+		   || streq (optarg, "on"))
 	    disassembler_color = on;
 	  else if (streq (optarg, "extended")
 		   || streq (optarg, "extended-color")
@@ -6171,6 +6467,12 @@ main (int argc, char **argv)
 	case OPTION_DWARF_CHECK:
 	  dwarf_check = true;
 	  break;
+        case OPTION_BTF:
+          dump_btf_section_info = true;
+          if (optarg)
+            dump_btf_section_name = xstrdup (optarg);
+          seenflag = true;
+          break;
 #ifdef ENABLE_LIBCTF
 	case OPTION_CTF:
 	  dump_ctf_section_info = true;
@@ -6272,6 +6574,7 @@ main (int argc, char **argv)
     }
 
   free_only_list ();
+  free (dump_btf_section_name);
   free (dump_ctf_section_name);
   free (dump_ctf_parent_name);
   free ((void *) source_comment);

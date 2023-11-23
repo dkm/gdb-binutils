@@ -1,0 +1,10 @@
+@c This file contains the entry for the --btf option that is
+@c common to both readelf and objdump.
+
+@item --btf[=@var{section}]
+@cindex BTF
+
+Display the contents of the specified BTF section.
+
+By default, display the name of the section named @var{.BTF}, which is the
+name emitted by compilers.

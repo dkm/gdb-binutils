@@ -2276,6 +2276,7 @@ objdump [@option{-a}|@option{--archive-headers}]
         [@option{-wD}|@option{--dwarf=use-debuginfod}]
         [@option{-wE}|@option{--dwarf=do-not-use-debuginfod}]
         [@option{-L}|@option{--process-links}]
+        [@option{--btf=}@var{section}]
         [@option{--ctf=}@var{section}]
         [@option{--sframe=}@var{section}]
         [@option{-G}|@option{--stabs}]
@@ -2884,6 +2885,8 @@ The @option{off} argument disables colored disassembly.
 
 @item --dwarf-check
 Enable additional checks for consistency of Dwarf information.
+
+@include btf.options.texi
 
 @include ctf.options.texi
 
